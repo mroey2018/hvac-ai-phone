@@ -1,19 +1,22 @@
+
 import express from "express";
 import bodyParser from "body-parser";
 import { WebSocketServer } from "ws";
 
 const app = express();
+
+// Twilio posts x-www-form-urlencoded
+app.use(express.urlencoded({ extended: false }));
 app.use(bodyParser.urlencoded({ extended: false }));
 
-const BASE_URL = "https://hvac-ai-phone.onrender.com";
 const PUBLIC_HOST = "hvac-ai-phone.onrender.com"; // for wss://
 
 app.get("/", (_, res) => res.send("Server running"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// 1) Incoming call hits here (Twilio Voice Webhook)
 app.post("/voice", (req, res) => {
-  res.type("text/xml");
-  res.send(`
+  res.status(200).type("text/xml").send(`
 <Response>
   <Say voice="alice">
     Welcome to HVAC Services Pro.
@@ -24,18 +27,24 @@ app.post("/voice", (req, res) => {
     For Warranty press 5.
   </Say>
 
-  <Gather numDigits="1" action="${BASE_URL}/menu" method="POST" timeout="7">
+  <!-- IMPORTANT: Use relative action -->
+  <Gather input="dtmf" numDigits="1" action="/menu" method="POST" timeout="7">
     <Say voice="alice">Please press 1, 2, 3, 4, or 5 now.</Say>
   </Gather>
 
   <Say voice="alice">Sorry, I did not get a selection.</Say>
-  <Redirect method="POST">${BASE_URL}/voice</Redirect>
+  <!-- IMPORTANT: Use relative redirect -->
+  <Redirect method="POST">/voice</Redirect>
 </Response>
   `);
 });
 
+// 2) Twilio posts the pressed digit here
 app.post("/menu", (req, res) => {
-  const d = (req.body.Digits || "").trim();
+  // Log everything so we can debug instantly
+  console.log("✅ /menu hit. Body:", req.body);
+
+  const d = (req.body?.Digits || "").trim();
 
   const deptMap = {
     "1": "sales",
@@ -48,8 +57,7 @@ app.post("/menu", (req, res) => {
   const dept = deptMap[d] || "general";
   const streamUrl = `wss://${PUBLIC_HOST}/media`;
 
-  res.type("text/xml");
-  res.send(`
+  res.status(200).type("text/xml").send(`
 <Response>
   <Say voice="alice">Got it. Connecting you now.</Say>
   <Connect>
@@ -62,7 +70,7 @@ app.post("/menu", (req, res) => {
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {
-  console.log("Server started");
+  console.log("✅ Server started");
 });
 
 const wss = new WebSocketServer({ server, path: "/media" });
@@ -78,4 +86,3 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => console.log("❎ Twilio stream disconnected"));
 });
-
