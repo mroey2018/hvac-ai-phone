@@ -98,23 +98,22 @@ wss.on("connection", (twilioWs, req) => {
     openaiWs.on("open", () => {
       console.log("✅ OpenAI Realtime connected");
 
-      openaiWs.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            audio: {
-              input: { format: "g711_ulaw" },
-              output: { format: "g711_ulaw" }
-            },
-            instructions: `You are an HVAC Services Pro phone agent.
+     openaiWs.send(
+  JSON.stringify({
+    type: "session.update",
+    session: {
+      input_audio_format: "g711_ulaw",
+      output_audio_format: "g711_ulaw",
+      voice: "alloy",
+      turn_detection: { type: "server_vad" },
+      instructions: `You are HVAC Services Pro's phone agent.
 Department: ${department}.
 Be concise, friendly, and ask one question at a time.
-Never say you are an AI.`,
-            voice: "alloy",
-            turn_detection: { type: "server_vad" }
-          }
-        })
-      );
+Never say you are an AI.`
+    }
+  })
+);
+           
 
       // Option B: small “thinking” pause before greeting
       setTimeout(() => {
