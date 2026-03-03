@@ -1,4 +1,5 @@
-import express from "express";
+
+  import express from "express";
 import bodyParser from "body-parser";
 import WebSocket from "ws";
 import { WebSocketServer } from "ws";
@@ -42,9 +43,16 @@ app.post("/menu", (req, res) => {
   console.log("✅ /menu hit. Body:", req.body);
 
   const d = (req.body?.Digits || "").trim();
-  const deptMap = { "1": "sales", "2": "dispatch", "3": "service", "4": "billing", "5": "warranty" };
-  const dept = deptMap[d] || "general";
 
+  const deptMap = {
+    "1": "sales",
+    "2": "dispatch",
+    "3": "service",
+    "4": "billing",
+    "5": "warranty",
+  };
+
+  const dept = deptMap[d] || "general";
   const streamUrl = `wss://${PUBLIC_HOST}/media`;
 
   res.status(200).type("text/xml").send(`
@@ -71,112 +79,157 @@ wss.on("connection", (twilioWs, req) => {
 
   let streamSid = null;
   let department = "general";
-
-  if (!process.env.OPENAI_API_KEY) {
-    console.log("❌ OPENAI_API_KEY missing in Render env");
-  }
-
-  // OpenAI Realtime WS
-  const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-realtime",
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1",
-      },
-    }
-  );
-
+  let openaiWs = null;
   let openaiReady = false;
   let greeted = false;
 
-  openaiWs.on("open", () => {
-    openaiReady = true;
-    console.log("✅ OpenAI Realtime connected");
+  function connectOpenAI() {
+    if (!process.env.OPENAI_API_KEY) {
+      console.log("❌ OPENAI_API_KEY missing in Render env");
+      return;
+    }
 
-    // Use output_audio.delta events and stream them to Twilio. :contentReference[oaicite:1]{index=1}
-    openaiWs.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        // Twilio Media Streams default is G.711 μ-law (PCMU). :contentReference[oaicite:2]{index=2}
-        input_audio_format: "pcmu",
-        output_audio_format: "pcmu",
-        voice: "alloy",
-        turn_detection: { type: "server_vad" },
-        instructions: `You are HVAC Services Pro's phone agent.
+    openaiWs = new WebSocket(
+      "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "OpenAI-Beta": "realtime=v1",
+        },
+      }
+    );
+
+    openaiWs.on("open", () => {
+      openaiReady = true;
+      console.log("✅ OpenAI Realtime connected");
+
+      // IMPORTANT: OpenAI supports these formats only:
+      // pcm16, g711_ulaw, g711_alaw
+      // Twilio Media Streams is μ-law => use g711_ulaw
+      openaiWs.send(
+        JSON.stringify({
+          type: "session.update",
+          session: {
+            input_audio_format: "g711_ulaw",
+            output_audio_format: "g711_ulaw",
+            voice: "alloy",
+            turn_detection: { type: "server_vad" },
+            instructions: `You are HVAC Services Pro's phone agent.
 Department: ${department}.
 Be concise, friendly, and ask one question at a time.
-Never say you are an AI.`
+Never say you are an AI.`,
+          },
+        })
+      );
+    });
+
+    openaiWs.on("message", (data) => {
+      let evt;
+      try {
+        evt = JSON.parse(data.toString());
+      } catch {
+        return;
       }
-    }));
-  });
 
-  openaiWs.on("message", (data) => {
-    let evt;
-    try { evt = JSON.parse(data.toString()); } catch { return; }
+      // Forward OpenAI audio back to Twilio (support both event names)
+      const audioDelta =
+        (evt.type === "response.output_audio.delta" ||
+          evt.type === "response.audio.delta") &&
+        evt.delta
+          ? evt.delta
+          : null;
 
-    // IMPORTANT: correct audio event name for WS streaming
-    if (evt.type === "response.output_audio.delta" && evt.delta && streamSid) {
-      twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: evt.delta } // base64 PCMU
-      }));
-    }
+      if (audioDelta && streamSid) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: audioDelta }, // base64 g711_ulaw
+          })
+        );
+      }
 
-    if (evt.type === "error") {
-      console.log("❌ OpenAI error:", evt);
-    }
-  });
+      if (evt.type === "error") {
+        console.log("❌ OpenAI error:", evt);
+      }
+    });
 
-  openaiWs.on("close", () => console.log("❎ OpenAI disconnected"));
-  openaiWs.on("error", (e) => console.log("❌ OpenAI ws error:", e.message));
+    openaiWs.on("close", () => {
+      openaiReady = false;
+      console.log("❎ OpenAI disconnected");
+    });
+
+    openaiWs.on("error", (e) => {
+      console.log("❌ OpenAI ws error:", e.message);
+    });
+  }
+
+  // Start OpenAI when Twilio connects (safe)
+  connectOpenAI();
 
   twilioWs.on("message", (msg) => {
     let evt;
-    try { evt = JSON.parse(msg.toString()); } catch { return; }
+    try {
+      evt = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
 
     if (evt.event === "start") {
       streamSid = evt.start?.streamSid || null;
       department = evt.start?.customParameters?.department || "general";
       console.log("▶️ start event received", { streamSid, department });
 
-      // Update instructions with the department (optional but helpful)
-      if (openaiReady) {
-        openaiWs.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            instructions: `You are HVAC Services Pro's phone agent.
+      // Update instructions now that we know department
+      if (openaiReady && openaiWs?.readyState === WebSocket.OPEN) {
+        try {
+          openaiWs.send(
+            JSON.stringify({
+              type: "session.update",
+              session: {
+                instructions: `You are HVAC Services Pro's phone agent.
 Department: ${department}.
 Be concise, friendly, and ask one question at a time.
-Never say you are an AI.`
-          }
-        }));
+Never say you are an AI.`,
+              },
+            })
+          );
+        } catch {}
       }
     }
 
     if (evt.event === "media") {
       const payload = evt.media?.payload;
 
-      if (payload && openaiReady) {
-        // Send caller audio to OpenAI
-        openaiWs.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: payload
-        }));
+      if (payload && openaiReady && openaiWs?.readyState === WebSocket.OPEN) {
+        // If caller talks while AI is talking, cancel (more natural)
+        try {
+          openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+        } catch {}
 
-        // Option B: greet after we actually receive caller audio (prevents silent calls)
+        // Send caller audio to OpenAI
+        openaiWs.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: payload,
+          })
+        );
+
+        // Option B: greet only after we received caller audio (prevents silence)
         if (!greeted) {
           greeted = true;
           setTimeout(() => {
             try {
-              openaiWs.send(JSON.stringify({
-                type: "response.create",
-                response: {
-                  modalities: ["audio", "text"],
-                  instructions: "Greet the caller warmly and ask how you can help today."
-                }
-              }));
+              openaiWs.send(
+                JSON.stringify({
+                  type: "response.create",
+                  response: {
+                    modalities: ["audio", "text"],
+                    instructions:
+                      "Greet the caller warmly and ask how you can help today.",
+                  },
+                })
+              );
             } catch {}
           }, 1200);
         }
@@ -185,15 +238,25 @@ Never say you are an AI.`
 
     if (evt.event === "stop") {
       console.log("⏹ stop event received");
-      try { openaiWs.close(); } catch {}
+      try {
+        openaiWs?.close();
+      } catch {}
     }
   });
 
   twilioWs.on("close", () => {
     console.log("❎ Twilio stream disconnected");
-    try { openaiWs.close(); } catch {}
+    try {
+      openaiWs?.close();
+    } catch {}
   });
 });
 
+
+
+ 
+
     
+
         
+  
