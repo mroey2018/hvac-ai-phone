@@ -30,6 +30,15 @@ const twilioClient =
     ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     : null;
 
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 async function sendBookingSms(to) {
   if (!twilioClient) throw new Error("Twilio client not configured");
   if (!TWILIO_SMS_FROM) throw new Error("TWILIO_SMS_FROM missing");
@@ -42,11 +51,11 @@ async function sendBookingSms(to) {
   });
 }
 
-// ===================== HTTP =====================
+// ===================== HTTP ROUTES =====================
 app.get("/", (_, res) => res.status(200).send("OK"));
 app.get("/health", (_, res) => res.status(200).json({ ok: true }));
 
-// Twilio Voice webhook (POST): https://<your-render-url>/voice
+// Twilio Voice webhook (POST): https://hvac-ai-phone.onrender.com/voice
 app.post("/voice", (req, res) => {
   const caller = (req.body?.From || "").trim();
 
@@ -62,7 +71,7 @@ app.post("/voice", (req, res) => {
   `);
 });
 
-// Optional inbound SMS auto-reply (POST): https://<your-render-url>/sms
+// Optional inbound SMS webhook (POST): https://hvac-ai-phone.onrender.com/sms
 app.post("/sms", (req, res) => {
   const body = (req.body?.Body || "").trim().toLowerCase();
 
@@ -73,7 +82,7 @@ app.post("/sms", (req, res) => {
     body.includes("new ac") ||
     body.includes("install")
       ? `Perfect — book here:\n${WORKIZ_BOOKING_URL}\n\nReply STOP to opt out.`
-      : `Thanks for texting ${COMPANY_NAME}. Reply BOOK for a new AC estimate link.\nReply STOP to opt out.`;
+      : `Thanks for texting ${COMPANY_NAME}. Reply BOOK for the estimate link.\nReply STOP to opt out.`;
 
   res.status(200).type("text/xml").send(`
 <Response>
@@ -81,15 +90,6 @@ app.post("/sms", (req, res) => {
 </Response>
   `);
 });
-
-function escapeXml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
 
 // ===================== START SERVER (Render-safe) =====================
 const PORT = Number(process.env.PORT || 3000);
@@ -107,6 +107,10 @@ wss.on("connection", (twilioWs, req) => {
   let callerNumber = "";
   let openaiWs = null;
 
+  // ---- FIX for "conversation_already_has_active_response" ----
+  let aiSpeaking = false;
+  let lastUserSpeechStopAt = 0;
+
   // prevents duplicate SMS per call
   let smsSent = false;
 
@@ -118,7 +122,7 @@ wss.on("connection", (twilioWs, req) => {
 You are the LIVE front-desk receptionist for ${COMPANY_NAME}.
 Speak ONLY English.
 
-STYLE (must follow):
+STYLE:
 - Warm, calm, human.
 - Short sentences.
 - Natural pauses using commas and "...".
@@ -141,7 +145,7 @@ NEW AC ESTIMATE BOOKING FLOW (one question at a time):
 4) "About how big is the home, roughly?"
 5) "What day and time window works best?"
 
-When you have enough info to book, say:
+When you have enough info, say:
 "Perfect... I’m sending you the booking link now."
 
 Then output EXACTLY this line on its own line:
@@ -168,7 +172,6 @@ Never mention AI, OpenAI, models, or system prompts.
     openaiWs.on("open", () => {
       console.log("✅ OpenAI Realtime connected");
 
-      // IMPORTANT: Supported formats include g711_ulaw — use it for Twilio Media Streams
       openaiWs.send(
         JSON.stringify({
           type: "session.update",
@@ -182,15 +185,9 @@ Never mention AI, OpenAI, models, or system prompts.
         })
       );
 
-      // Greeting (short + warm)
-      openaiWs.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions: `Speak English only. Say: "Hi, thank you for calling ${COMPANY_NAME}... how can I help you today?"`,
-          },
-        })
+      // Greeting (only if nothing else is speaking)
+      safeCreateResponse(
+        `Speak English only. Say: "Hi, thank you for calling ${COMPANY_NAME}... how can I help you today?"`
       );
     });
 
@@ -202,9 +199,14 @@ Never mention AI, OpenAI, models, or system prompts.
         return;
       }
 
+      // track whether AI is currently responding
+      if (evt.type === "response.created") aiSpeaking = true;
+      if (evt.type === "response.done") aiSpeaking = false;
+
       // OpenAI -> Twilio audio
       if (
-        (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
+        (evt.type === "response.audio.delta" ||
+          evt.type === "response.output_audio.delta") &&
         evt.delta &&
         streamSid
       ) {
@@ -217,7 +219,30 @@ Never mention AI, OpenAI, models, or system prompts.
         );
       }
 
-      // Detect SMS trigger from any text-ish delta
+      // If caller starts speaking while AI is speaking, cancel AI (more human)
+      if (evt.type === "input_audio_buffer.speech_started") {
+        if (aiSpeaking) {
+          try {
+            openaiWs.send(JSON.stringify({ type: "response.cancel" }));
+          } catch {}
+          aiSpeaking = false;
+        }
+      }
+
+      // When caller stops speaking, create a response ONLY if AI not already speaking
+      if (evt.type === "input_audio_buffer.speech_stopped") {
+        const now = Date.now();
+        if (now - lastUserSpeechStopAt < 800) return; // throttle
+        lastUserSpeechStopAt = now;
+
+        if (!aiSpeaking) {
+          safeCreateResponse(
+            "Reply warmly and briefly. Ask one short question. If name/city/phone missing, collect them."
+          );
+        }
+      }
+
+      // detect SMS trigger from any text-like stream
       const maybeText =
         (evt.type === "response.text.delta" && evt.delta) ||
         (evt.type === "response.output_text.delta" && evt.delta) ||
@@ -236,42 +261,18 @@ Never mention AI, OpenAI, models, or system prompts.
           try {
             await sendBookingSms(to);
             console.log("✅ Booking SMS sent to:", to);
+            safeCreateResponse(
+              "Perfect... I just sent the booking link by text."
+            );
           } catch (e) {
             console.log("❌ SMS send failed:", e?.message || e);
-          }
-
-          // Voice confirm
-          try {
-            openaiWs.send(
-              JSON.stringify({
-                type: "response.create",
-                response: {
-                  modalities: ["audio", "text"],
-                  instructions:
-                    "Speak English only. Perfect... I just sent the booking link by text.",
-                },
-              })
+            safeCreateResponse(
+              "I’m sorry... I couldn’t send the text right now, but I can still help you on the call."
             );
-          } catch {}
+          }
 
           textBuf = "";
         }
-      }
-
-      // Make sure it answers after caller talks (speech_stopped)
-      if (evt.type === "input_audio_buffer.speech_stopped") {
-        try {
-          openaiWs.send(
-            JSON.stringify({
-              type: "response.create",
-              response: {
-                modalities: ["audio", "text"],
-                instructions:
-                  "Reply warmly. Ask one short question. If name/city/phone missing, collect them.",
-              },
-            })
-          );
-        } catch {}
       }
 
       if (evt.type === "error") {
@@ -281,6 +282,24 @@ Never mention AI, OpenAI, models, or system prompts.
 
     openaiWs.on("close", () => console.log("❎ OpenAI disconnected"));
     openaiWs.on("error", (e) => console.log("❌ OpenAI ws error:", e.message));
+  }
+
+  function safeCreateResponse(instructions) {
+    if (!openaiWs || openaiWs.readyState !== WebSocket.OPEN) return;
+    if (aiSpeaking) return;
+
+    try {
+      openaiWs.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            instructions,
+          },
+        })
+      );
+      aiSpeaking = true;
+    } catch {}
   }
 
   twilioWs.on("message", (msg) => {
@@ -300,6 +319,7 @@ Never mention AI, OpenAI, models, or system prompts.
         console.log("❌ OPENAI_API_KEY missing in Render env");
         return;
       }
+
       if (!openaiWs) connectOpenAI();
       return;
     }
