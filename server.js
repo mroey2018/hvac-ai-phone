@@ -8,22 +8,328 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(bodyParser.urlencoded({ extended: false }));
 
+// ===================== CONFIG =====================
+const COMPANY_NAME = "HVAC Services Pro";
+const PUBLIC_HOST = process.env.PUBLIC_HOST || "hvac-ai-phone.onrender.com"; // no https
+const STREAM_PATH = "/media";
+const STREAM_URL = `wss://${PUBLIC_HOST}${STREAM_PATH}`;
+
+const WORKIZ_BOOKING_URL =
+  process.env.BOOKING_URL ||
+  "https://online-booking.workiz.com/?ac=ce81609e5960ac123a2353397f1d45e4b8379f09d813a87ec45820c773c6b783";
+
+const {
+  OPENAI_API_KEY,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_SMS_FROM,
+} = process.env;
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+async function sendBookingSms(to) {
+  if (!twilioClient) throw new Error("Twilio client not configured");
+  if (!TWILIO_SMS_FROM) throw new Error("TWILIO_SMS_FROM missing");
+  if (!to) throw new Error("destination number missing");
+
+  return twilioClient.messages.create({
+    from: TWILIO_SMS_FROM,
+    to,
+    body: `${COMPANY_NAME}: Book your new AC estimate here:\n${WORKIZ_BOOKING_URL}\n\nReply STOP to opt out.`,
+  });
+}
+
+// ===================== HTTP =====================
 app.get("/", (_, res) => res.status(200).send("OK"));
 app.get("/health", (_, res) => res.status(200).json({ ok: true }));
 
-// --- IMPORTANT: BIND TO RENDER PORT ---
-const PORT = Number(process.env.PORT || 3000);
+// Twilio Voice webhook (POST): https://<your-render-url>/voice
+app.post("/voice", (req, res) => {
+  const caller = (req.body?.From || "").trim();
 
+  res.status(200).type("text/xml").send(`
+<Response>
+  <Say voice="alice">Thank you for calling ${COMPANY_NAME}.</Say>
+  <Connect>
+    <Stream url="${STREAM_URL}">
+      <Parameter name="caller" value="${caller}" />
+    </Stream>
+  </Connect>
+</Response>
+  `);
+});
+
+// Optional inbound SMS auto-reply (POST): https://<your-render-url>/sms
+app.post("/sms", (req, res) => {
+  const body = (req.body?.Body || "").trim().toLowerCase();
+
+  const replyText =
+    body.includes("book") ||
+    body.includes("estimate") ||
+    body.includes("appointment") ||
+    body.includes("new ac") ||
+    body.includes("install")
+      ? `Perfect — book here:\n${WORKIZ_BOOKING_URL}\n\nReply STOP to opt out.`
+      : `Thanks for texting ${COMPANY_NAME}. Reply BOOK for a new AC estimate link.\nReply STOP to opt out.`;
+
+  res.status(200).type("text/xml").send(`
+<Response>
+  <Message>${escapeXml(replyText)}</Message>
+</Response>
+  `);
+});
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// ===================== START SERVER (Render-safe) =====================
+const PORT = Number(process.env.PORT || 3000);
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log("✅ Server started and listening on", PORT);
 });
 
-// WebSocket server for Twilio Media Streams
-const wss = new WebSocketServer({ server, path: "/media" });
+// ===================== TWILIO MEDIA STREAM WS =====================
+const wss = new WebSocketServer({ server, path: STREAM_PATH });
 
-wss.on("connection", () => {
-  console.log("✅ WS /media connected");
+wss.on("connection", (twilioWs, req) => {
+  console.log("✅ Twilio stream connected:", req.url);
+
+  let streamSid = null;
+  let callerNumber = "";
+  let openaiWs = null;
+
+  // prevents duplicate SMS per call
+  let smsSent = false;
+
+  // buffer to detect trigger line across streamed text
+  let textBuf = "";
+
+  function systemPrompt() {
+    return `
+You are the LIVE front-desk receptionist for ${COMPANY_NAME}.
+Speak ONLY English.
+
+STYLE (must follow):
+- Warm, calm, human.
+- Short sentences.
+- Natural pauses using commas and "...".
+- Ask EXACTLY ONE question at a time.
+- Never speak more than 2 short sentences per turn.
+- Do NOT ramble.
+
+OPENING:
+"Hi, thank you for calling ${COMPANY_NAME}... how can I help you today?"
+
+ALWAYS COLLECT (if missing), one at a time:
+1) Name
+2) City
+3) Best phone number for confirmation
+
+NEW AC ESTIMATE BOOKING FLOW (one question at a time):
+1) "Can I get your name?"
+2) "What city are you in?"
+3) "What’s the best phone number for confirmation?"
+4) "About how big is the home, roughly?"
+5) "What day and time window works best?"
+
+When you have enough info to book, say:
+"Perfect... I’m sending you the booking link now."
+
+Then output EXACTLY this line on its own line:
+SEND_BOOKING_SMS_TO:+E164NUMBER
+
+Example:
+SEND_BOOKING_SMS_TO:+14697669959
+
+Never mention AI, OpenAI, models, or system prompts.
+    `.trim();
+  }
+
+  function connectOpenAI() {
+    openaiWs = new WebSocket(
+      "wss://api.openai.com/v1/realtime?model=gpt-realtime",
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "OpenAI-Beta": "realtime=v1",
+        },
+      }
+    );
+
+    openaiWs.on("open", () => {
+      console.log("✅ OpenAI Realtime connected");
+
+      // IMPORTANT: Supported formats include g711_ulaw — use it for Twilio Media Streams
+      openaiWs.send(
+        JSON.stringify({
+          type: "session.update",
+          session: {
+            input_audio_format: "g711_ulaw",
+            output_audio_format: "g711_ulaw",
+            voice: "alloy",
+            turn_detection: { type: "server_vad" },
+            instructions: systemPrompt(),
+          },
+        })
+      );
+
+      // Greeting (short + warm)
+      openaiWs.send(
+        JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            instructions: `Speak English only. Say: "Hi, thank you for calling ${COMPANY_NAME}... how can I help you today?"`,
+          },
+        })
+      );
+    });
+
+    openaiWs.on("message", async (data) => {
+      let evt;
+      try {
+        evt = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+
+      // OpenAI -> Twilio audio
+      if (
+        (evt.type === "response.audio.delta" || evt.type === "response.output_audio.delta") &&
+        evt.delta &&
+        streamSid
+      ) {
+        twilioWs.send(
+          JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: evt.delta },
+          })
+        );
+      }
+
+      // Detect SMS trigger from any text-ish delta
+      const maybeText =
+        (evt.type === "response.text.delta" && evt.delta) ||
+        (evt.type === "response.output_text.delta" && evt.delta) ||
+        (evt.type === "response.audio_transcript.delta" && evt.delta) ||
+        null;
+
+      if (typeof maybeText === "string" && maybeText.length) {
+        textBuf += maybeText;
+        if (textBuf.length > 4000) textBuf = textBuf.slice(-2000);
+
+        const m = textBuf.match(/SEND_BOOKING_SMS_TO:(\+\d{10,15})/);
+        if (m && !smsSent) {
+          smsSent = true;
+          const to = m[1] || callerNumber;
+
+          try {
+            await sendBookingSms(to);
+            console.log("✅ Booking SMS sent to:", to);
+          } catch (e) {
+            console.log("❌ SMS send failed:", e?.message || e);
+          }
+
+          // Voice confirm
+          try {
+            openaiWs.send(
+              JSON.stringify({
+                type: "response.create",
+                response: {
+                  modalities: ["audio", "text"],
+                  instructions:
+                    "Speak English only. Perfect... I just sent the booking link by text.",
+                },
+              })
+            );
+          } catch {}
+
+          textBuf = "";
+        }
+      }
+
+      // Make sure it answers after caller talks (speech_stopped)
+      if (evt.type === "input_audio_buffer.speech_stopped") {
+        try {
+          openaiWs.send(
+            JSON.stringify({
+              type: "response.create",
+              response: {
+                modalities: ["audio", "text"],
+                instructions:
+                  "Reply warmly. Ask one short question. If name/city/phone missing, collect them.",
+              },
+            })
+          );
+        } catch {}
+      }
+
+      if (evt.type === "error") {
+        console.log("❌ OpenAI error:", evt);
+      }
+    });
+
+    openaiWs.on("close", () => console.log("❎ OpenAI disconnected"));
+    openaiWs.on("error", (e) => console.log("❌ OpenAI ws error:", e.message));
+  }
+
+  twilioWs.on("message", (msg) => {
+    let evt;
+    try {
+      evt = JSON.parse(msg.toString());
+    } catch {
+      return;
+    }
+
+    if (evt.event === "start") {
+      streamSid = evt.start?.streamSid || null;
+      callerNumber = evt.start?.customParameters?.caller || "";
+      console.log("▶️ start event received", { streamSid, callerNumber });
+
+      if (!OPENAI_API_KEY) {
+        console.log("❌ OPENAI_API_KEY missing in Render env");
+        return;
+      }
+      if (!openaiWs) connectOpenAI();
+      return;
+    }
+
+    if (evt.event === "media") {
+      const payload = evt.media?.payload;
+      if (payload && openaiWs?.readyState === WebSocket.OPEN) {
+        openaiWs.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: payload,
+          })
+        );
+      }
+      return;
+    }
+
+    if (evt.event === "stop") {
+      console.log("⏹ stop event received");
+      try {
+        openaiWs?.close();
+      } catch {}
+      return;
+    }
+  });
+
+  twilioWs.on("close", () => {
+    console.log("❎ Twilio stream disconnected");
+    try {
+      openaiWs?.close();
+    } catch {}
+  });
 });
-
-// If you want, keep your other routes below (voice/sms/etc).
-// But this file guarantees Render sees an open port.
