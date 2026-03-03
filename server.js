@@ -5,10 +5,12 @@ import { WebSocketServer } from "ws";
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-// Your Render public host (no https://)
-const PUBLIC_HOST = "hvac-ai-phone.onrender.com";
+const BASE_URL = "https://hvac-ai-phone.onrender.com";
+const PUBLIC_HOST = "hvac-ai-phone.onrender.com"; // for wss://
 
-// Incoming call -> play menu -> gather 1 digit
+app.get("/", (_, res) => res.send("Server running"));
+app.get("/health", (_, res) => res.json({ ok: true }));
+
 app.post("/voice", (req, res) => {
   res.type("text/xml");
   res.send(`
@@ -22,17 +24,16 @@ app.post("/voice", (req, res) => {
     For Warranty press 5.
   </Say>
 
-  <Gather numDigits="1" action="/menu" method="POST" timeout="6">
+  <Gather numDigits="1" action="${BASE_URL}/menu" method="POST" timeout="7">
     <Say voice="alice">Please press 1, 2, 3, 4, or 5 now.</Say>
   </Gather>
 
   <Say voice="alice">Sorry, I did not get a selection.</Say>
-  <Redirect method="POST">/voice</Redirect>
+  <Redirect method="POST">${BASE_URL}/voice</Redirect>
 </Response>
   `);
 });
 
-// After digit -> start Twilio Media Stream to /media
 app.post("/menu", (req, res) => {
   const d = (req.body.Digits || "").trim();
 
@@ -51,25 +52,19 @@ app.post("/menu", (req, res) => {
   res.send(`
 <Response>
   <Say voice="alice">Got it. Connecting you now.</Say>
-
   <Connect>
     <Stream url="${streamUrl}">
       <Parameter name="department" value="${dept}" />
     </Stream>
   </Connect>
-
-  <Say voice="alice">Thanks for calling HVAC Services Pro.</Say>
 </Response>
   `);
 });
-
-app.get("/", (_, res) => res.send("Server running"));
 
 const server = app.listen(process.env.PORT || 3000, () => {
   console.log("Server started");
 });
 
-// WebSocket endpoint Twilio connects to
 const wss = new WebSocketServer({ server, path: "/media" });
 
 wss.on("connection", (ws, req) => {
@@ -83,3 +78,4 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => console.log("❎ Twilio stream disconnected"));
 });
+
