@@ -1,8 +1,8 @@
-
 import express from "express";
 import bodyParser from "body-parser";
 import WebSocket from "ws";
 import { WebSocketServer } from "ws";
+import twilio from "twilio";
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -10,9 +10,20 @@ app.use(bodyParser.urlencoded({ extended: false }));
 
 const PUBLIC_HOST = "hvac-ai-phone.onrender.com";
 
+// Your Workiz booking link (you gave this)
+const BOOKING_URL =
+  "https://online-booking.workiz.com/?ac=ce81609e5960ac123a2353397f1d45e4b8379f09d813a87ec45820c773c6b783";
+
+// Twilio SMS client (optional but recommended)
+const twilioClient =
+  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
+    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
+    : null;
+
 app.get("/", (_, res) => res.send("Server running"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// 1) Incoming call -> menu
 app.post("/voice", (req, res) => {
   res.status(200).type("text/xml").send(`
 <Response>
@@ -35,12 +46,22 @@ app.post("/voice", (req, res) => {
   `);
 });
 
+// 2) Digit -> connect to Media Stream
 app.post("/menu", (req, res) => {
-  console.log("✅ /menu hit. Digits:", req.body?.Digits);
+  console.log("✅ /menu hit. Body:", req.body);
 
   const d = (req.body?.Digits || "").trim();
-  const deptMap = { "1": "sales", "2": "dispatch", "3": "service", "4": "billing", "5": "warranty" };
+  const deptMap = {
+    "1": "sales",
+    "2": "dispatch",
+    "3": "service",
+    "4": "billing",
+    "5": "warranty",
+  };
   const dept = deptMap[d] || "general";
+
+  // Twilio provides caller number in From
+  const caller = (req.body?.From || "").trim();
 
   const streamUrl = `wss://${PUBLIC_HOST}/media`;
 
@@ -50,6 +71,7 @@ app.post("/menu", (req, res) => {
   <Connect>
     <Stream url="${streamUrl}">
       <Parameter name="department" value="${dept}" />
+      <Parameter name="caller" value="${caller}" />
     </Stream>
   </Connect>
 </Response>
@@ -60,6 +82,7 @@ const server = app.listen(process.env.PORT || 3000, () => {
   console.log("✅ Server started");
 });
 
+// Twilio Media Stream WS endpoint
 const wss = new WebSocketServer({ server, path: "/media" });
 
 wss.on("connection", (twilioWs, req) => {
@@ -67,157 +90,283 @@ wss.on("connection", (twilioWs, req) => {
 
   let streamSid = null;
   let department = "general";
+  let callerNumber = "";
+
+  let openaiWs = null;
   let openaiReady = false;
 
-  // Print each OpenAI event type once (helps diagnose “silence” instantly)
-  const seenTypes = new Set();
+  // Track whether OpenAI is actively speaking so we don’t spam cancel
+  let responseActive = false;
 
-  if (!process.env.OPENAI_API_KEY) {
-    console.log("❌ OPENAI_API_KEY missing in Render env");
-    twilioWs.close();
-    return;
+  // Avoid duplicate bookings per call
+  let booked = false;
+
+  // Basic “human” timing
+  const humanDelayMs = () => 250 + Math.floor(Math.random() * 350);
+
+  function safeJsonParse(s) {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return null;
+    }
   }
 
-  const openaiWs = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime", {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1",
-    },
-  });
+  function sendTwilioMedia(base64Audio) {
+    if (!streamSid) return;
+    twilioWs.send(
+      JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: base64Audio },
+      })
+    );
+  }
 
   function oaiSend(obj) {
-    if (openaiWs.readyState === WebSocket.OPEN) {
+    if (openaiWs?.readyState === WebSocket.OPEN) {
       openaiWs.send(JSON.stringify(obj));
       return true;
     }
     return false;
   }
 
-  function sendGreeting() {
-    // Force an audio response
-    oaiSend({
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions: `You are the ${department} department.
-Greet the caller warmly and ask how you can help today.`,
+  async function sendBookingLinkSms(to) {
+    if (!twilioClient) {
+      console.log("⚠️ Twilio SMS not configured (missing TWILIO_ACCOUNT_SID/AUTH_TOKEN)");
+      return false;
+    }
+    if (!process.env.TWILIO_SMS_FROM) {
+      console.log("⚠️ Missing TWILIO_SMS_FROM env var (SMS-capable Twilio number)");
+      return false;
+    }
+    if (!to) {
+      console.log("⚠️ No caller number to send SMS to");
+      return false;
+    }
+
+    await twilioClient.messages.create({
+      to,
+      from: process.env.TWILIO_SMS_FROM,
+      body: `HVAC Services Pro — book your NEW AC estimate here:\n${BOOKING_URL}\nReply to this text if you want us to book it for you.`,
+    });
+
+    console.log("✅ Booking link SMS sent to:", to);
+    return true;
+  }
+
+  function buildInstructions() {
+    return `You are HVAC Services Pro’s front-desk phone agent.
+Speak ENGLISH ONLY (United States). Never switch languages.
+
+Sound like a real person:
+- Warm, natural, short sentences.
+- Use quick fillers sometimes (“Got it—one sec”, “Okay, perfect”).
+- Ask ONE question at a time.
+- Confirm details out loud.
+- Don’t mention AI, models, policies, or being virtual.
+
+Department: ${department}
+
+Department rules:
+- Sales: ask city + home size/tonnage + timeline + budget range if appropriate.
+- Dispatch: ask address + issue + availability window.
+- Service: ask symptoms + is system running + any error code/ice/water.
+- Billing/Warranty: ask invoice/phone + keep it brief.
+
+BOOKING rule (NEW AC estimate):
+If the caller wants to book an appointment for a NEW AC system estimate:
+1) Collect these fields (one question at a time):
+   - full name
+   - best phone number (confirm the number on caller ID is OK, or get a different one)
+   - service address (street + city)
+   - preferred day/time window (e.g., “tomorrow 2–5” or “any weekday after 4”)
+   - home size or tonnage (optional)
+2) After collecting required fields, output ONE line exactly:
+   BOOK_NEW_AC_ESTIMATE | name=<...> | phone=<...> | address=<...> | window=<...> | size=<...>
+3) Then say: “Perfect — I’m booking that now and I’ll text you the confirmation link.”`;
+  }
+
+  function parseBookingLine(text) {
+    if (!text) return null;
+    if (!text.includes("BOOK_NEW_AC_ESTIMATE")) return null;
+
+    const parts = text.split("|").map((x) => x.trim());
+    const kv = {};
+    for (const p of parts) {
+      const m = p.match(/^(\w+)\s*=\s*(.+)$/);
+      if (m) kv[m[1]] = m[2];
+    }
+    return {
+      name: kv.name || "",
+      phone: kv.phone || "",
+      address: kv.address || "",
+      window: kv.window || "",
+      size: kv.size || "",
+    };
+  }
+
+  function speakConfirmSentLink() {
+    // Make the agent confirm on the call (audio)
+    const delay = humanDelayMs();
+    setTimeout(() => {
+      oaiSend({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions:
+            "Speak English only. Say: “All set — I just texted you the booking link. If you don’t see it in 30 seconds, tell me and I’ll resend.” Then stop.",
+        },
+      });
+    }, delay);
+  }
+
+  function greet() {
+    const delay = humanDelayMs();
+    setTimeout(() => {
+      oaiSend({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions:
+            "Speak English only. Say: “Hi! Thanks for calling HVAC Services Pro—this is Mia. How can I help you today?” Then stop.",
+        },
+      });
+    }, delay);
+  }
+
+  function connectOpenAI() {
+    if (!process.env.OPENAI_API_KEY) {
+      console.log("❌ OPENAI_API_KEY missing in Render env");
+      return;
+    }
+
+    openaiWs = new WebSocket("wss://api.openai.com/v1/realtime?model=gpt-realtime", {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1",
       },
+    });
+
+    openaiWs.on("open", () => {
+      openaiReady = true;
+      console.log("✅ OpenAI Realtime connected");
+
+      // Supported formats: pcm16, g711_ulaw, g711_alaw :contentReference[oaicite:1]{index=1}
+      oaiSend({
+        type: "session.update",
+        session: {
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          voice: process.env.OPENAI_VOICE || "verse",
+          modalities: ["audio", "text"],
+          turn_detection: { type: "server_vad" },
+          instructions: buildInstructions(),
+        },
+      });
+
+      // We’ll greet once we receive Twilio "start" so streamSid exists.
+    });
+
+    openaiWs.on("message", async (data) => {
+      const msg = safeJsonParse(data.toString());
+      if (!msg) return;
+
+      // Track response lifecycle to avoid cancel spam
+      if (msg.type === "response.created") responseActive = true;
+      if (msg.type === "response.done") responseActive = false;
+
+      // AUDIO OUT (support both common event names)
+      const audioDelta =
+        (msg.type === "response.output_audio.delta" || msg.type === "response.audio.delta") && msg.delta
+          ? msg.delta
+          : null;
+
+      if (audioDelta && streamSid) {
+        sendTwilioMedia(audioDelta);
+      }
+
+      // TEXT OUT (catch booking trigger line)
+      // Different builds can deliver text in different fields — check a few.
+      let textOut = null;
+
+      if (msg.type === "response.output_text.delta" && msg.delta) textOut = msg.delta;
+      if (msg.type === "response.text.delta" && msg.delta) textOut = msg.delta;
+
+      // Some responses include full text blocks:
+      if (!textOut && typeof msg.text === "string") textOut = msg.text;
+      if (!textOut && typeof msg.delta === "string" && msg.type?.includes("text")) textOut = msg.delta;
+
+      // Booking detection
+      const booking = parseBookingLine(textOut);
+      if (booking && !booked) {
+        booked = true;
+        console.log("📅 Booking captured:", booking);
+
+        // Prefer SMS to the phone they provided; fallback to caller ID
+        const to = booking.phone || callerNumber;
+
+        try {
+          await sendBookingLinkSms(to);
+        } catch (e) {
+          console.log("❌ Failed to send SMS:", e?.message || e);
+        }
+
+        // Confirm on call
+        speakConfirmSentLink();
+      }
+
+      // Log errors clearly
+      if (msg.type === "error") {
+        console.log("❌ OpenAI error:", msg?.error?.code, msg?.error?.message);
+      }
+    });
+
+    openaiWs.on("close", () => {
+      openaiReady = false;
+      responseActive = false;
+      console.log("❎ OpenAI disconnected");
+    });
+
+    openaiWs.on("error", (e) => {
+      console.log("❌ OpenAI ws error:", e.message);
     });
   }
 
-  openaiWs.on("open", () => {
-    openaiReady = true;
-    console.log("✅ OpenAI Realtime connected");
-
-    // Supported formats: pcm16, g711_ulaw, g711_alaw
-    oaiSend({
-      type: "session.update",
-      session: {
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        voice: "alloy",
-        turn_detection: { type: "server_vad" },
-        instructions: `You are HVAC Services Pro's phone agent.
-Department: ${department}.
-Be concise, friendly, ask one question at a time.
-Never say you are an AI.`,
-      },
-    });
-
-    // Speak first after a short pause
-    setTimeout(sendGreeting, 600);
-  });
-
-  openaiWs.on("message", (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
-
-    // Log event types once
-    if (msg?.type && !seenTypes.has(msg.type)) {
-      seenTypes.add(msg.type);
-      console.log("🟦 OpenAI event type:", msg.type);
-    }
-
-    // Any error: print code + message
-    if (msg.type === "error") {
-      console.log("❌ OpenAI error:", msg?.error?.code, msg?.error?.message);
-      return;
-    }
-
-    // ---- AUDIO OUT: robust extraction ----
-    // Different builds may use different event names/fields:
-    // - response.output_audio.delta { delta: base64 }
-    // - response.audio.delta { delta: base64 }
-    // - response.output_audio.chunk { chunk: base64 }
-    // - sometimes { audio: base64 }
-    let audioB64 = null;
-
-    const isAudioEvent =
-      msg.type === "response.output_audio.delta" ||
-      msg.type === "response.audio.delta" ||
-      msg.type === "response.output_audio.chunk";
-
-    if (isAudioEvent) {
-      audioB64 = msg.delta || msg.audio || msg.chunk || null;
-    }
-
-    if (audioB64 && streamSid) {
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: audioB64 }, // base64 g711_ulaw
-        })
-      );
-    }
-  });
-
-  openaiWs.on("close", () => {
-    openaiReady = false;
-    console.log("❎ OpenAI disconnected");
-  });
-
-  openaiWs.on("error", (e) => {
-    console.log("❌ OpenAI ws error:", e.message);
-  });
+  connectOpenAI();
 
   twilioWs.on("message", (raw) => {
-    let evt;
-    try {
-      evt = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    const evt = safeJsonParse(raw.toString());
+    if (!evt) return;
 
     if (evt.event === "start") {
       streamSid = evt.start?.streamSid || null;
       department = evt.start?.customParameters?.department || "general";
-      console.log("▶️ start event received", { streamSid, department });
+      callerNumber = evt.start?.customParameters?.caller || "";
 
-      // Update department in session (if already open)
+      console.log("▶️ start event received", { streamSid, department, callerNumber });
+
+      // Update instructions now that dept is known
       if (openaiReady) {
         oaiSend({
           type: "session.update",
-          session: {
-            instructions: `You are HVAC Services Pro's phone agent.
-Department: ${department}.
-Be concise, friendly, ask one question at a time.
-Never say you are an AI.`,
-          },
+          session: { instructions: buildInstructions() },
         });
-
-        // Speak again right after start (some calls need this)
-        setTimeout(sendGreeting, 300);
       }
+
+      // Greet
+      greet();
     }
 
     if (evt.event === "media") {
       const payload = evt.media?.payload;
+
       if (payload && openaiReady) {
+        // Only cancel if a response is actually active (prevents spam)
+        if (responseActive) {
+          oaiSend({ type: "response.cancel" });
+        }
+
         // Send caller audio to OpenAI
         oaiSend({
           type: "input_audio_buffer.append",
@@ -228,12 +377,16 @@ Never say you are an AI.`,
 
     if (evt.event === "stop") {
       console.log("⏹ stop event received");
-      try { openaiWs.close(); } catch {}
+      try {
+        openaiWs?.close();
+      } catch {}
     }
   });
 
   twilioWs.on("close", () => {
     console.log("❎ Twilio stream disconnected");
-    try { openaiWs.close(); } catch {}
+    try {
+      openaiWs?.close();
+    } catch {}
   });
 });
